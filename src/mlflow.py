@@ -180,25 +180,5 @@ def show_detailed_run_info(run_id=None):
     except Exception as e:
         print(f"Error retrieving run information: {e}")
 
-if __name__ == "__main__":
-    print("[INFO] Starting MLflow Demonstration...")
+# if __name__ == "__main__":
     
-    # Main demonstration
-    demonstrate_mlflow_tracking()
-    
-    # Detailed run info
-    show_detailed_run_info()
-    
-    print("\n" + "=" * 60)
-    print("[INFO] MLflow Demonstration Complete!")
-    print("\n[INFO] To view the MLflow UI:")
-    print("   1. Run: mlflow ui")
-    print("   2. Open: http://localhost:5000")
-    print("\n[INFO] Key MLflow Features Demonstrated:")
-    print("   [INFO] Experiment tracking")
-    print("   [INFO] Parameter logging")
-    print("   [INFO] Metrics logging")
-    print("   [INFO] Model logging and registration")
-    print("   [INFO] Artifact storage")
-    print("   [INFO] Model versioning")
-    print("   [INFO] Run comparison") 

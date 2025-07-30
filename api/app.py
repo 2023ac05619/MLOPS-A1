@@ -3,12 +3,33 @@ import json
 import time
 import sqlite3
 from datetime import datetime
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template_string
 import joblib
 import numpy as np
-import pandas as pd
+from pydantic import ValidationError
+from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
+from schemas import PredictionRequest, PredictionResponse, RetrainingRequest, NewDataSample
+import threading
+import sys
+
+
+# Add the src directory to the Python path
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
+try:
+    from model_training_simple import main as retrain_models
+except ImportError:
+    def retrain_models():
+        print("Model retraining module not available")
 
 app = Flask(__name__)
+
+# Prometheus metrics
+REQUEST_COUNT = Counter('prediction_requests_total', 'Total prediction requests', ['method', 'endpoint'])
+REQUEST_LATENCY = Histogram('prediction_request_duration_seconds', 'Request latency')
+PREDICTION_COUNTER = Counter('predictions_total', 'Total predictions made', ['predicted_class'])
+MODEL_ACCURACY = Gauge('model_accuracy', 'Current model accuracy')
+ACTIVE_CONNECTIONS = Gauge('active_connections', 'Number of active connections')
+RETRAIN_TRIGGER_COUNT = Counter('retraining_triggered_total', 'Number of times retraining was triggered')
 
 # Global variables for monitoring
 request_count = 0
@@ -17,59 +38,19 @@ model = None
 scaler = None
 feature_names = None
 target_names = None
+new_data_samples = []  # Store new samples for retraining
+retrain_threshold = 10
 
-# Initialize SQLite database for logging
-def init_db():
-    """Initialize SQLite database for logging predictions."""
-    conn = sqlite3.connect('logs/predictions.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS predictions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            input_data TEXT,
-            prediction TEXT,
-            confidence REAL,
-            latency REAL
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-def load_model_and_metadata():
-    """Load the trained model, scaler, and metadata."""
-    global model, scaler, feature_names, target_names
-    
-    try:
-        # Load metadata
-        with open('models/metadata.json', 'r') as f:
-            metadata = json.load(f)
-        
-        feature_names = metadata['feature_names']
-        target_names = metadata['target_names']
-        best_model = metadata['best_model']
-        
-        # Load the appropriate model
-        if best_model == "LogisticRegression":
-            model = joblib.load('models/logistic_regression_model.pkl')
-        else:
-            model = joblib.load('models/random_forest_model.pkl')
-        
-        # Load scaler
-        scaler = joblib.load('models/scaler.pkl')
-        
-        print(f"[INFO] Loaded {best_model} model successfully!")
-        return True
-        
-    except Exception as e:
-        print(f"[ERROR] Error loading model: {e}")
-        return False
 
 def log_prediction(input_data, prediction, confidence, latency):
     """Log prediction to both file and SQLite database."""
+    
+    # Get the current timestamp in ISO format
     timestamp = datetime.now().isoformat()
     
-    # Log to file
+    print(f"[INFO] Logging prediction with timestamp {timestamp}")
+    
+    # Create a log entry as a dictionary
     log_entry = {
         "timestamp": timestamp,
         "input": input_data,
@@ -78,200 +59,149 @@ def log_prediction(input_data, prediction, confidence, latency):
         "latency": latency
     }
     
+    print(f"[INFO] Logging to file: {log_entry}")
+    
+    # Create a directory for logging if it doesn't exist
     os.makedirs('logs', exist_ok=True)
+    
+    # Append the log entry to a file named 'requests.log' in the 'logs' directory
     with open('logs/requests.log', 'a') as f:
         f.write(json.dumps(log_entry) + '\n')
     
-    # Log to SQLite
+    # Log to SQLite database
     try:
+        # Connect to the database
         conn = sqlite3.connect('logs/predictions.db')
+        
+        # Create a cursor object to execute SQL queries
         cursor = conn.cursor()
+        
+        # Execute an SQL query to insert the log entry into the 'predictions' table
         cursor.execute('''
             INSERT INTO predictions (timestamp, input_data, prediction, confidence, latency)
             VALUES (?, ?, ?, ?, ?)
         ''', (timestamp, json.dumps(input_data), prediction, confidence, latency))
+        
+        # Commit the database changes
         conn.commit()
+        
+        # Close the database connection
         conn.close()
     except Exception as e:
-        print(f"Warning: Could not log to database: {e}")
+        print(f"[ERROR] Could not log to database: {e}")
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint."""
-    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
 
-@app.route('/predict', methods=['POST'])
-def predict():
-    """Make predictions on input data."""
-    global request_count, total_latency
+def store_new_training_data(features, target):
+    timestamp = datetime.now().isoformat()
     
-    start_time = time.time()
+    print(f"[INFO] Storing new training data with timestamp {timestamp}")
     
     try:
-        # Get input data
-        data = request.get_json()
-        
-        if not data or 'features' not in data:
-            return jsonify({
-                "error": "Invalid input. Expected JSON with 'features' key."
-            }), 400
-        
-        features = data['features']
-        
-        # Validate input features
-        if len(features) != 4:
-            return jsonify({
-                "error": f"Expected 4 features, got {len(features)}"
-            }), 400
-        
-        # Convert to numpy array and scale
-        features_array = np.array(features).reshape(1, -1)
-        features_scaled = scaler.transform(features_array)
-        
-        # Make prediction
-        prediction = model.predict(features_scaled)[0]
-        prediction_proba = model.predict_proba(features_scaled)[0]
-        confidence = float(max(prediction_proba))
-        
-        # Get prediction name
-        prediction_name = target_names[prediction]
-        
-        # Calculate latency
-        latency = time.time() - start_time
-        
-        # Update global metrics
-        request_count += 1
-        total_latency += latency
-        
-        # Log the prediction
-        log_prediction(features, prediction_name, confidence, latency)
-        
-        response = {
-            "prediction": int(prediction),
-            "prediction_name": prediction_name,
-            "confidence": confidence,
-            "probabilities": {
-                target_names[i]: float(prob) for i, prob in enumerate(prediction_proba)
-            },
-            "latency": latency
-        }
-        
-        return jsonify(response)
-        
-    except Exception as e:
-        latency = time.time() - start_time
-        request_count += 1
-        total_latency += latency
-        
-        return jsonify({
-            "error": str(e),
-            "latency": latency
-        }), 500
-
-@app.route('/metrics', methods=['GET'])
-def metrics():
-    """Expose metrics endpoint for monitoring."""
-    avg_latency = total_latency / request_count if request_count > 0 else 0
-    
-    # Get database stats
-    try:
+        # Connect to the SQLite database
         conn = sqlite3.connect('logs/predictions.db')
+        
+        # Create a cursor to execute SQL queries
         cursor = conn.cursor()
-        cursor.execute('SELECT COUNT(*) FROM predictions')
-        total_predictions = cursor.fetchone()[0]
         
-        cursor.execute('SELECT AVG(latency) FROM predictions')
-        avg_db_latency = cursor.fetchone()[0] or 0
-        
-        cursor.execute('SELECT prediction, COUNT(*) FROM predictions GROUP BY prediction')
-        prediction_counts = dict(cursor.fetchall())
-        
-        conn.close()
-    except:
-        total_predictions = 0
-        avg_db_latency = 0
-        prediction_counts = {}
-    
-    metrics_data = {
-        "request_count": request_count,
-        "total_predictions": total_predictions,
-        "average_latency": avg_latency,
-        "average_db_latency": avg_db_latency,
-        "prediction_distribution": prediction_counts,
-        "model_info": {
-            "feature_names": feature_names,
-            "target_names": target_names,
-            "model_loaded": model is not None
-        },
-        "timestamp": datetime.now().isoformat()
-    }
-    
-    return jsonify(metrics_data)
-
-@app.route('/predictions/history', methods=['GET'])
-def prediction_history():
-    """Get recent prediction history from database."""
-    limit = request.args.get('limit', 10, type=int)
-    
-    try:
-        conn = sqlite3.connect('logs/predictions.db')
-        cursor = conn.cursor()
+        # Execute an SQL query to insert the new training data into the 'new_training_data' table
         cursor.execute('''
-            SELECT timestamp, input_data, prediction, confidence, latency 
-            FROM predictions 
-            ORDER BY timestamp DESC 
-            LIMIT ?
-        ''', (limit,))
+            INSERT INTO new_training_data (timestamp, features, target)
+            VALUES (?, ?, ?)
+        ''', (timestamp, json.dumps(features), target))
         
-        rows = cursor.fetchall()
+        # Commit the database changes
+        conn.commit()
+        
+        # Close the database connection
         conn.close()
         
-        history = []
-        for row in rows:
-            history.append({
-                "timestamp": row[0],
-                "input_data": json.loads(row[1]),
-                "prediction": row[2],
-                "confidence": row[3],
-                "latency": row[4]
-            })
+        print("[INFO] Stored new training data successfully!")
         
-        return jsonify({"history": history, "count": len(history)})
-        
+        # Return True to indicate that the data was stored successfully
+        return True
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        # Print an error message if an exception occurred
+        print(f"[ERROR] Error storing training data: {e}")
+        
+        # Return False to indicate that the data was not stored successfully
+        return False
 
-@app.route('/', methods=['GET'])
-def home():
-    """Home endpoint with API documentation."""
-    return jsonify({
-        "message": "Iris Classification API",
-        "endpoints": {
-            "/health": "Health check",
-            "/predict": "Make predictions (POST)",
-            "/metrics": "System metrics",
-            "/predictions/history": "Recent prediction history"
-        },
-        "example_request": {
-            "features": [5.1, 3.5, 1.4, 0.2]
-        }
-    })
 
-if __name__ == '__main__':
-    # Initialize database
-    init_db()
+def check_retrain_trigger():
+    """Check if we have enough new samples to trigger retraining."""
     
-    # Load model and metadata
-    if not load_model_and_metadata():
-        print("[ERROR] Failed to load model. Please train the model first.")
-        exit(1)
-
-    print("[INFO] Starting Flask API server...")
-    print("[INFO] API endpoints available:")
-    print("  - GET  /           : API documentation")
-    print("  - GET  /health     : Health check")
-    print("  - POST /predict    : Make predictions")
-    print("  - GET  /metrics    : System metrics")
-    print("  - GET  /predictions/history : Recent predictions")
+    try:
+        # Connect to the SQLite database
+        conn = sqlite3.connect('logs/predictions.db')
+        
+        # Create a cursor object to execute SQL queries
+        cursor = conn.cursor()
+        
+        # Execute an SQL query to count the number of new training samples
+        # that have not been used for training yet
+        cursor.execute('''
+            SELECT COUNT(*) FROM new_training_data WHERE used_for_training = FALSE
+        ''')
+        
+        # Fetch the result of the query, which is the count of new samples
+        count = cursor.fetchone()[0]
+        
+        # Close the database connection
+        conn.close()
+        
+        # Return True if the number of new samples meets or exceeds the retrain threshold
+        return count >= retrain_threshold
     
-    app.run(host='0.0.0.0', port=5000, debug=False) 
+    except Exception as e:
+        # Print an error message if an exception occurred
+        print(f"Error checking retrain trigger: {e}")
+        
+        # Return False to indicate that we could not check the retrain trigger
+        return False
+
+
+def trigger_retraining():
+    """Trigger model retraining in background thread."""
+    def retrain():
+        try:
+            print("[INFO] Starting background model retraining...")
+            RETRAIN_TRIGGER_COUNT.inc()
+            
+            # Mark data as used for training
+            conn = sqlite3.connect('logs/predictions.db')
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE new_training_data SET used_for_training = TRUE 
+                WHERE used_for_training = FALSE
+            ''')
+            conn.commit()
+            conn.close()
+            
+            # Trigger retraining
+            retrain_models()
+            
+            # Reload the updated model
+            load_model_and_metadata()
+            print("[INFO] Model retraining completed successfully!")
+            
+        except Exception as e:
+            print(f"[ERROR] Error during retraining: {e}")
+    
+    thread = threading.Thread(target=retrain)
+    thread.daemon = True
+    thread.start()
+
+
+@app.before_request
+def before_request():
+    """Track active connections."""
+    ACTIVE_CONNECTIONS.inc()
+
+
+@app.after_request
+def after_request(response):
+    """Track request completion."""
+    ACTIVE_CONNECTIONS.dec()
+    return response
+
+

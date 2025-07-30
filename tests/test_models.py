@@ -7,7 +7,7 @@ import pandas as pd
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from src.data_preprocessing import load_and_preprocess_data
+from preprocess_data import load_and_preprocess_data
 
 def test_load_and_preprocess_data():
     """Test data loading and preprocessing function."""
